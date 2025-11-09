@@ -234,13 +234,18 @@ public class DiscordAudioStreamBot extends ListenerAdapter {
     @Override
     public void onGuildVoiceUpdate(@NotNull GuildVoiceUpdateEvent event) {
         // Ignore bot's own voice state changes to prevent infinite loops
-        if(event.getMember().getUser().equals(jda.getSelfUser())) {
+        // Use ID comparison for more reliable detection (especially in JDA beta versions)
+        if(event.getMember().getId().equals(jda.getSelfUser().getId())) {
+            logger.debug("Ignoring bot's own voice state change in guild: " + event.getGuild().getName());
             return;
         }
         
         if(!isFollowedVoiceTarget(event.getMember())) {
             return;
         }
+        
+        logger.info("Voice update detected for followed user: " + event.getMember().getEffectiveName() + 
+                    " in guild: " + event.getGuild().getName());
 
         if(event.getChannelJoined() != null && event.getChannelLeft() != null) {
             // audio channel moved
@@ -329,14 +334,39 @@ public class DiscordAudioStreamBot extends ListenerAdapter {
     public void joinAudio(AudioChannel channel) {
         AudioManager audioManager = channel.getGuild().getAudioManager();
         
+        logger.info("=== JOIN AUDIO REQUEST === Channel: " + channel.getName() + 
+                    " (ID: " + channel.getId() + "), Guild: " + channel.getGuild().getName() + 
+                    ", Type: " + (channel instanceof StageChannel ? "STAGE" : "VOICE"));
+        
         // Check if already connected to the same channel to prevent redundant operations
         if (audioManager.isConnected() && channel.equals(audioManager.getConnectedChannel())) {
             logger.debug("Already connected to channel: " + channel.getName());
             return;
         }
         
-        updateSpeakState(audioManager, null, null);
-        updateListenState(audioManager, null, null);
+        // Log current connection state
+        if (audioManager.isConnected()) {
+            logger.info("Currently connected to: " + audioManager.getConnectedChannel().getName());
+        } else {
+            logger.info("Not currently connected to any channel in this guild");
+        }
+        
+        // Setup handlers before connecting - but don't fail if devices aren't available
+        // This allows the bot to connect even without audio devices configured
+        try {
+            updateSpeakState(audioManager, null, null);
+            logger.debug("Speak handler setup completed");
+        } catch (Exception ex) {
+            logger.warn("Failed to setup speak handler, continuing with connection anyway", ex);
+        }
+        
+        try {
+            updateListenState(audioManager, null, null);
+            logger.debug("Listen handler setup completed");
+        } catch (Exception ex) {
+            logger.warn("Failed to setup listen handler, continuing with connection anyway", ex);
+        }
+        
         audioManager.setConnectionListener(new ConnectionListener() {
             @Override
             public void onPing(long ping) {
@@ -345,16 +375,27 @@ public class DiscordAudioStreamBot extends ListenerAdapter {
 
             @Override
             public void onStatusChange(@Nonnull ConnectionStatus status) {
+                logger.info("*** Voice Connection Status Changed *** Status: " + status + 
+                           ", Channel: " + channel.getName() + 
+                           ", Guild: " + audioManager.getGuild().getName());
+                
                 try {
                     switch (status) {
                         case CONNECTED: {
+                            logger.info("Successfully CONNECTED to voice channel: " + channel.getName());
                             AudioSendHandler sendingHandler = audioManager.getSendingHandler();
                             if (sendingHandler instanceof SpeakHandler) {
-                                ((SpeakHandler) sendingHandler).setPlaying(true);
+                                try {
+                                    ((SpeakHandler) sendingHandler).setPlaying(true);
+                                    logger.debug("Speak handler started playing");
+                                } catch (Exception ex) {
+                                    logger.warn("Failed to start speak handler after connection", ex);
+                                }
                             }
                             // Handle stage channel - request to speak after connection
                             if (channel instanceof StageChannel) {
                                 StageChannel stageChannel = (StageChannel) channel;
+                                logger.info("Stage channel detected, requesting to speak...");
                                 try {
                                     // Request to speak (or become speaker if bot has permission)
                                     stageChannel.requestToSpeak().queue(
@@ -367,16 +408,66 @@ public class DiscordAudioStreamBot extends ListenerAdapter {
                             }
                             break;
                         }
-                        default: {
+                        case DISCONNECTED:
+                            logger.warn("Voice connection DISCONNECTED from channel: " + channel.getName());
+                            // Don't try to restart handlers on disconnect to prevent loops
                             AudioSendHandler sendingHandler = audioManager.getSendingHandler();
                             if (sendingHandler instanceof SpeakHandler) {
-                                ((SpeakHandler) sendingHandler).setPlaying(false);
+                                try {
+                                    ((SpeakHandler) sendingHandler).setPlaying(false);
+                                    logger.debug("Speak handler stopped");
+                                } catch (Exception ex) {
+                                    logger.warn("Failed to pause speak handler", ex);
+                                }
                             }
                             break;
-                        }
+                        case ERROR:
+                            logger.error("Voice connection ERROR occurred for channel: " + channel.getName());
+                            AudioSendHandler errorHandler = audioManager.getSendingHandler();
+                            if (errorHandler instanceof SpeakHandler) {
+                                try {
+                                    ((SpeakHandler) errorHandler).setPlaying(false);
+                                    logger.debug("Speak handler stopped due to error");
+                                } catch (Exception ex) {
+                                    logger.warn("Failed to pause speak handler after error", ex);
+                                }
+                            }
+                            break;
+                        case AUDIO_REGION_CHANGE:
+                            logger.info("Audio region changed for channel: " + channel.getName());
+                            AudioSendHandler regionHandler = audioManager.getSendingHandler();
+                            if (regionHandler instanceof SpeakHandler) {
+                                try {
+                                    ((SpeakHandler) regionHandler).setPlaying(false);
+                                    logger.debug("Speak handler paused for region change");
+                                } catch (Exception ex) {
+                                    logger.warn("Failed to pause speak handler for region change", ex);
+                                }
+                            }
+                            break;
+                        case CONNECTING_AWAITING_ENDPOINT:
+                            logger.debug("Connecting to voice channel (awaiting endpoint)...");
+                            break;
+                        case CONNECTING_AWAITING_WEBSOCKET_CONNECT:
+                            logger.debug("Connecting to voice channel (awaiting websocket)...");
+                            break;
+                        case CONNECTING_AWAITING_AUTHENTICATION:
+                            logger.debug("Connecting to voice channel (awaiting authentication)...");
+                            break;
+                        case CONNECTING_ATTEMPTING_UDP_DISCOVERY:
+                            logger.debug("Connecting to voice channel (attempting UDP discovery)...");
+                            break;
+                        case CONNECTING_AWAITING_READY:
+                            logger.debug("Connecting to voice channel (awaiting ready)...");
+                            break;
+                        default:
+                            logger.debug("Voice connection status: " + status);
+                            break;
                     }
                 } catch (BassException ex) {
                     logger.error("Failed to pause/unpause speak handler for guild " + audioManager.getGuild().getName(), ex);
+                } catch (Exception ex) {
+                    logger.error("Unexpected error in connection status handler", ex);
                 }
             }
 
@@ -385,15 +476,41 @@ public class DiscordAudioStreamBot extends ListenerAdapter {
 
             }
         });
+        
+        logger.info("Opening audio connection to channel: " + channel.getName() + " (ID: " + channel.getId() + ")");
         audioManager.openAudioConnection(channel);
+        logger.info("Audio connection request sent successfully");
     }
 
     public void leaveAudio(Guild guild) {
         AudioManager audioManager = guild.getAudioManager();
+        logger.info("=== LEAVE AUDIO REQUEST === Guild: " + guild.getName());
+        
         if (audioManager.isConnected()) {
-            updateSpeakState(audioManager, false, null);
-            updateListenState(audioManager, false, null);
-            audioManager.closeAudioConnection();
+            logger.info("Leaving audio channel: " + audioManager.getConnectedChannel().getName());
+            
+            try {
+                updateSpeakState(audioManager, false, null);
+                logger.debug("Speak handler cleaned up");
+            } catch (Exception ex) {
+                logger.warn("Failed to cleanup speak handler while leaving audio channel", ex);
+            }
+            
+            try {
+                updateListenState(audioManager, false, null);
+                logger.debug("Listen handler cleaned up");
+            } catch (Exception ex) {
+                logger.warn("Failed to cleanup listen handler while leaving audio channel", ex);
+            }
+            
+            try {
+                audioManager.closeAudioConnection();
+                logger.info("Audio connection closed successfully");
+            } catch (Exception ex) {
+                logger.error("Failed to close audio connection for guild " + guild.getName(), ex);
+            }
+        } else {
+            logger.info("Not connected to any audio channel in this guild");
         }
     }
 
