@@ -11,6 +11,7 @@ import net.dv8tion.jda.api.audio.AudioSendHandler;
 import net.dv8tion.jda.api.audio.hooks.ConnectionListener;
 import net.dv8tion.jda.api.audio.hooks.ConnectionStatus;
 import net.dv8tion.jda.api.entities.*;
+import net.dv8tion.jda.api.entities.channel.concrete.StageChannel;
 import net.dv8tion.jda.api.entities.channel.middleman.AudioChannel;
 import net.dv8tion.jda.api.events.StatusChangeEvent;
 import net.dv8tion.jda.api.events.guild.voice.GuildVoiceUpdateEvent;
@@ -232,6 +233,11 @@ public class DiscordAudioStreamBot extends ListenerAdapter {
 
     @Override
     public void onGuildVoiceUpdate(@NotNull GuildVoiceUpdateEvent event) {
+        // Ignore bot's own voice state changes to prevent infinite loops
+        if(event.getMember().getUser().equals(jda.getSelfUser())) {
+            return;
+        }
+        
         if(!isFollowedVoiceTarget(event.getMember())) {
             return;
         }
@@ -322,6 +328,13 @@ public class DiscordAudioStreamBot extends ListenerAdapter {
 
     public void joinAudio(AudioChannel channel) {
         AudioManager audioManager = channel.getGuild().getAudioManager();
+        
+        // Check if already connected to the same channel to prevent redundant operations
+        if (audioManager.isConnected() && channel.equals(audioManager.getConnectedChannel())) {
+            logger.debug("Already connected to channel: " + channel.getName());
+            return;
+        }
+        
         updateSpeakState(audioManager, null, null);
         updateListenState(audioManager, null, null);
         audioManager.setConnectionListener(new ConnectionListener() {
@@ -338,6 +351,19 @@ public class DiscordAudioStreamBot extends ListenerAdapter {
                             AudioSendHandler sendingHandler = audioManager.getSendingHandler();
                             if (sendingHandler instanceof SpeakHandler) {
                                 ((SpeakHandler) sendingHandler).setPlaying(true);
+                            }
+                            // Handle stage channel - request to speak after connection
+                            if (channel instanceof StageChannel) {
+                                StageChannel stageChannel = (StageChannel) channel;
+                                try {
+                                    // Request to speak (or become speaker if bot has permission)
+                                    stageChannel.requestToSpeak().queue(
+                                        success -> logger.info("Successfully requested to speak on stage channel: " + stageChannel.getName()),
+                                        error -> logger.warn("Failed to request to speak on stage channel: " + stageChannel.getName(), error)
+                                    );
+                                } catch (Exception ex) {
+                                    logger.warn("Error while requesting to speak on stage channel", ex);
+                                }
                             }
                             break;
                         }
